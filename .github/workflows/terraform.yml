@@ -1,0 +1,226 @@
+name: terraform
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# Least privilege by default; jobs that need more ask for it explicitly.
+permissions:
+  contents: read
+
+env:
+  TF_VERSION: "1.15.5"
+  TFLINT_VERSION: "v0.64.0"
+  TF_IN_AUTOMATION: "true"
+  TF_INPUT: "false"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Static checks: no cloud credentials needed
+  # ---------------------------------------------------------------------------
+  checks:
+    name: checks (${{ matrix.dir }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dir: [bootstrap, envs/dev, envs/prod]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive
+
+      - name: terraform init (no backend)
+        run: terraform -chdir=${{ matrix.dir }} init -backend=false
+
+      - name: terraform validate
+        run: terraform -chdir=${{ matrix.dir }} validate
+
+      - uses: terraform-linters/setup-tflint@v6
+        with:
+          tflint_version: ${{ env.TFLINT_VERSION }}
+
+      - name: tflint
+        env:
+          GITHUB_TOKEN: ${{ github.token }} # avoids rate limits when downloading the plugin
+        run: |
+          tflint --init --config="$GITHUB_WORKSPACE/.tflint.hcl"
+          tflint --chdir=${{ matrix.dir }} --config="$GITHUB_WORKSPACE/.tflint.hcl"
+
+      - name: checkov
+        uses: bridgecrewio/checkov-action@v12
+        with:
+          directory: ${{ matrix.dir }}
+          framework: terraform
+          quiet: true
+
+  # ---------------------------------------------------------------------------
+  # Plan on pull requests, authenticated keylessly via GitHub OIDC -> IAM role,
+  # and post the plan as a PR comment.
+  # ---------------------------------------------------------------------------
+  plan:
+    name: plan (${{ matrix.env }})
+    needs: checks
+    # Fork PRs don't get an OIDC token, so skip them instead of failing.
+    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write       # request the GitHub OIDC token
+      pull-requests: write  # comment the plan
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - env: dev
+            prefix: DEV
+          - env: prod
+            prefix: PROD
+    env:
+      ENV_DIR: envs/${{ matrix.env }}
+      STATE_BUCKET: ${{ vars[format('{0}_TF_STATE_BUCKET', matrix.prefix)] }}
+      TFVARS: ${{ vars[format('{0}_TFVARS', matrix.prefix)] }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars[format('{0}_TF_ROLE_ARN', matrix.prefix)] }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-plan-${{ matrix.env }}-${{ github.run_id }}
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: write terraform.tfvars
+        run: printf '%s\n' "$TFVARS" > "$ENV_DIR/terraform.tfvars"
+
+      - name: terraform init
+        run: terraform -chdir="$ENV_DIR" init -backend-config="bucket=$STATE_BUCKET" -backend-config="region=$AWS_REGION"
+
+      - name: terraform plan
+        run: |
+          terraform -chdir="$ENV_DIR" plan -no-color -lock-timeout=5m -out=tfplan
+          terraform -chdir="$ENV_DIR" show -no-color tfplan > plan.txt
+
+      - name: comment plan on PR
+        uses: actions/github-script@v9
+        env:
+          ENV_NAME: ${{ matrix.env }}
+        with:
+          script: |
+            const fs = require('fs');
+            const env = process.env.ENV_NAME;
+            const marker = `<!-- terraform-plan-${env} -->`;
+            let plan = fs.readFileSync('plan.txt', 'utf8');
+            const max = 60000; // GitHub comments are limited to 65536 chars
+            if (plan.length > max) plan = plan.slice(0, max) + '\n... (truncated, see workflow logs)';
+            const body = `${marker}\n### Terraform plan: \`${env}\`\n<details><summary>Show plan</summary>\n\n\`\`\`hcl\n${plan}\n\`\`\`\n</details>\n\n_Run [#${context.runNumber}](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId})_`;
+
+            const { data: comments } = await github.rest.issues.listComments({
+              ...context.repo, issue_number: context.issue.number, per_page: 100,
+            });
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ ...context.repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ ...context.repo, issue_number: context.issue.number, body });
+            }
+
+  # ---------------------------------------------------------------------------
+  # Apply on merge to main. dev applies automatically; prod waits for a
+  # required reviewer on the "prod" GitHub environment (configured in repo
+  # Settings -> Environments, see README). Running in an environment also sets
+  # the OIDC `sub` claim to repo:<owner>/<repo>:environment:<env>, which is what
+  # the IAM trust policy of each Terraform role checks.
+  # ---------------------------------------------------------------------------
+  apply-dev:
+    needs: checks
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: dev
+    concurrency:
+      group: terraform-apply-dev
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      ENV_DIR: envs/dev
+      STATE_BUCKET: ${{ vars.DEV_TF_STATE_BUCKET }}
+      TFVARS: ${{ vars.DEV_TFVARS }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.DEV_TF_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-apply-dev-${{ github.run_id }}
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: write terraform.tfvars
+        run: printf '%s\n' "$TFVARS" > "$ENV_DIR/terraform.tfvars"
+
+      - name: terraform init
+        run: terraform -chdir="$ENV_DIR" init -backend-config="bucket=$STATE_BUCKET" -backend-config="region=$AWS_REGION"
+
+      - name: terraform plan
+        run: terraform -chdir="$ENV_DIR" plan -lock-timeout=5m -out=tfplan
+
+      - name: terraform apply
+        run: terraform -chdir="$ENV_DIR" apply -lock-timeout=5m tfplan
+
+  apply-prod:
+    needs: apply-dev
+    runs-on: ubuntu-latest
+    environment: prod # protected: required reviewers must approve before this job starts
+    concurrency:
+      group: terraform-apply-prod
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      ENV_DIR: envs/prod
+      STATE_BUCKET: ${{ vars.PROD_TF_STATE_BUCKET }}
+      TFVARS: ${{ vars.PROD_TFVARS }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.PROD_TF_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+          role-session-name: gha-apply-prod-${{ github.run_id }}
+
+      - uses: hashicorp/setup-terraform@v4
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: write terraform.tfvars
+        run: printf '%s\n' "$TFVARS" > "$ENV_DIR/terraform.tfvars"
+
+      - name: terraform init
+        run: terraform -chdir="$ENV_DIR" init -backend-config="bucket=$STATE_BUCKET" -backend-config="region=$AWS_REGION"
+
+      - name: terraform plan
+        run: terraform -chdir="$ENV_DIR" plan -lock-timeout=5m -out=tfplan
+
+      - name: terraform apply
+        run: terraform -chdir="$ENV_DIR" apply -lock-timeout=5m tfplan

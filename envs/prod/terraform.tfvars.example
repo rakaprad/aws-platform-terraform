@@ -1,0 +1,24 @@
+# Copy to terraform.tfvars (git-ignored) and fill in. None of these are secrets.
+# Same account as dev in this example. With one account per environment
+# (recommended), use the prod account ID and the bucket bootstrapped there.
+account_id        = "123456789012"
+region            = "ap-southeast-3"
+state_bucket_name = "123456789012-tfstate-ap-southeast-3"
+github_repository = "rakaprad/aws-platform-terraform"
+# app_github_repository = "rakaprad/my-app"
+
+kubernetes_version = "1.36"
+
+# Prod API endpoint is private-only by default (reach it via VPN / bastion).
+# public_access_cidrs = ["203.0.113.10/32"]
+
+# Who gets cluster-admin, e.g. your SSO / admin role.
+cluster_admin_arns = ["arn:aws:iam::123456789012:role/Admin"]
+
+# dev already created the account-wide GitHub OIDC provider.
+# Remove this line if prod has its own account.
+create_github_oidc_provider = false
+
+# Optional: uncomment to create a monthly budget with email alerts.
+# budget_limit_usd    = 1000
+# budget_alert_emails = ["you@example.com"]
